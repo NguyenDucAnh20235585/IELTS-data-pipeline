@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Local data and generated artifacts
+workspaces/
+output/
+.local-data/
+*.pdf
+*.zip
+*.mp4
+*.bak
+
+# Secrets
+.env
+.env.*
+*.pem
+*.key
+*.p12
+
+# IDE
+.vscode/
+.idea/

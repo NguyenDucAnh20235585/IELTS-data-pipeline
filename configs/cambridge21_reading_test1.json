@@ -1,0 +1,206 @@
+{
+  "id": "cambridge21-reading-test1",
+  "title": "Cambridge IELTS 21 - Reading Test 1",
+  "source_pdf": "Cambridge 21.pdf",
+  "review_file": "stage3_review.json",
+  "reading_pages": {
+    "start": 17,
+    "end": 29
+  },
+  "answer_page": 119,
+  "passage_headings": {
+    "17": "READING\\s+PASSAGE\\s+1",
+    "21": "READING\\s+PASSAGE\\s+2",
+    "26": "READING\\s+PASSAGE\\s+3"
+  },
+  "groups": [
+    [
+      1,
+      7,
+      "NOTE_COMPLETION",
+      19
+    ],
+    [
+      8,
+      13,
+      "TRUE_FALSE_NOT_GIVEN",
+      20
+    ],
+    [
+      14,
+      17,
+      "MATCHING_INFORMATION",
+      23
+    ],
+    [
+      18,
+      21,
+      "SUMMARY_COMPLETION",
+      24
+    ],
+    [
+      22,
+      26,
+      "MATCHING_FEATURES",
+      25
+    ],
+    [
+      27,
+      30,
+      "MULTIPLE_CHOICE",
+      28
+    ],
+    [
+      31,
+      36,
+      "SUMMARY_WORD_BANK",
+      29
+    ],
+    [
+      37,
+      40,
+      "YES_NO_NOT_GIVEN",
+      29
+    ]
+  ],
+  "answer_reference": [
+    "mining",
+    "education",
+    "notes",
+    "journals",
+    "Venice",
+    "canteen",
+    "friends",
+    "TRUE",
+    "NOT GIVEN",
+    "FALSE",
+    "NOT GIVEN",
+    "TRUE",
+    "TRUE",
+    "C",
+    "B",
+    "A",
+    "G",
+    "breath",
+    "questionnaire",
+    "wellbeing",
+    "depression",
+    "C",
+    "A",
+    "B",
+    "D",
+    "C",
+    "B",
+    "A",
+    "C",
+    "A",
+    "H",
+    "E",
+    "I",
+    "A",
+    "G",
+    "C",
+    "YES",
+    "NOT GIVEN",
+    "NO",
+    "YES"
+  ],
+  "passage_titles": {
+    "1": "The Davies Sisters",
+    "2": "Why we need silence",
+    "3": "Book review: The World of Sugar by"
+  },
+  "passage_fixes": {
+    "1": {
+      "We lmow": "We know",
+      "we lmow": "we know",
+      "contemporaiy": "contemporary",
+      "well-lmown": "well-known",
+      "Provenc;al": "Provençal",
+      "Franc;ois": "François",
+      "·while": "While"
+    },
+    "2": {
+      "I-hour float": "1-hour float"
+    },
+    "3": {
+      "UlbeBosma": "Ulbe Bosma"
+    }
+  },
+  "choice_keys": {
+    "TRUE_FALSE_NOT_GIVEN": [
+      "TRUE",
+      "FALSE",
+      "NOT GIVEN"
+    ],
+    "YES_NO_NOT_GIVEN": [
+      "YES",
+      "NO",
+      "NOT GIVEN"
+    ],
+    "MATCHING_INFORMATION": [
+      "A",
+      "B",
+      "C",
+      "D",
+      "E",
+      "F",
+      "G"
+    ],
+    "MATCHING_FEATURES": [
+      "A",
+      "B",
+      "C",
+      "D"
+    ],
+    "SUMMARY_WORD_BANK": [
+      "A",
+      "B",
+      "C",
+      "D",
+      "E",
+      "F",
+      "G",
+      "H",
+      "I"
+    ],
+    "MULTIPLE_CHOICE": [
+      "A",
+      "B",
+      "C",
+      "D"
+    ]
+  },
+  "passage_display_titles": {
+    "3": "Book review: The World of Sugar by Ulbe Bosma"
+  },
+  "glossary": {
+    "1": [
+      {
+        "term": "philanthropic",
+        "definition": "seeking to promote the welfare of others, often by charitable funding"
+      },
+      {
+        "term": "Old Master",
+        "definition": "a highly respected artist of great skill who worked in Europe before about 1800"
+      },
+      {
+        "term": "Impressionist",
+        "definition": "an artist with a style of painting that developed in France in the late 1800s"
+      }
+    ]
+  },
+  "footer_cut_markers": {
+    "1": "*** Impressionist"
+  },
+  "group_text_fixes": {
+    "31-36": {
+      "ofthe": "of the"
+    }
+  },
+  "group_option_fixes": {
+    "22-26": {
+      "D": "Eric Pfeifer"
+    }
+  }
+}

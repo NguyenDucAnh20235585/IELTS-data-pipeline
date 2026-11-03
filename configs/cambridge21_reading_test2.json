@@ -1,0 +1,103 @@
+{
+  "id": "cambridge21-reading-test2",
+  "title": "Cambridge IELTS 21 - Reading Test 2",
+  "source_pdf": "Cambridge 21.pdf",
+  "review_file": "stage3_review_test2.json",
+  "reading_pages": {
+    "start": 39,
+    "end": 51
+  },
+  "answer_page": 121,
+  "passage_headings": {
+    "39": "READING\\s+PASSAGE\\s+1",
+    "43": "READING\\s+PASSAGE\\s+2",
+    "47": "READING\\s+PASSAGE\\s+3"
+  },
+  "groups": [
+    [1, 5, "TABLE_COMPLETION", 41],
+    [6, 13, "TRUE_FALSE_NOT_GIVEN", 42],
+    [14, 19, "MATCHING_INFORMATION", 45],
+    [20, 21, "MULTIPLE_CHOICE_TWO", 45],
+    [22, 26, "SUMMARY_COMPLETION", 46],
+    [27, 29, "MULTIPLE_CHOICE", 49],
+    [30, 35, "SUMMARY_WORD_BANK", 50],
+    [36, 39, "YES_NO_NOT_GIVEN", 51],
+    [40, 40, "MULTIPLE_CHOICE", 51]
+  ],
+  "answer_reference": [
+    "rats",
+    "visual",
+    "half",
+    "temperature",
+    "vivid",
+    "TRUE",
+    "FALSE",
+    "NOT GIVEN",
+    "FALSE",
+    "TRUE",
+    "FALSE",
+    "NOT GIVEN",
+    "NOT GIVEN",
+    "E",
+    "G",
+    "C",
+    "D",
+    "B",
+    "A",
+    "B",
+    "D",
+    "prosperity",
+    "whistles",
+    "bodies",
+    "ancestors",
+    "jewellery I jewelry",
+    "B",
+    "A",
+    "C",
+    "F",
+    "G",
+    "I",
+    "C",
+    "A",
+    "D",
+    "NO",
+    "NOT GIVEN",
+    "NO",
+    "YES",
+    "B"
+  ],
+  "passage_titles": {
+    "1": "Do animals dream?",
+    "2": "Mapungubwe",
+    "3": "Artificial Intelligence"
+  },
+  "passage_fixes": {
+    "1": {},
+    "2": {},
+    "3": {}
+  },
+  "choice_keys": {
+    "TRUE_FALSE_NOT_GIVEN": ["TRUE", "FALSE", "NOT GIVEN"],
+    "YES_NO_NOT_GIVEN": ["YES", "NO", "NOT GIVEN"],
+    "MATCHING_INFORMATION": ["A", "B", "C", "D", "E", "F", "G"],
+    "MULTIPLE_CHOICE_TWO": ["A", "B", "C", "D", "E"],
+    "SUMMARY_WORD_BANK": ["A", "B", "C", "D", "E", "F", "G", "H", "I"],
+    "MULTIPLE_CHOICE": ["A", "B", "C", "D"]
+  },
+  "passage_display_titles": {},
+  "glossary": {
+    "2": [
+      {
+        "term": "palisade",
+        "definition": "typically a row of closely placed, high vertical wooden or iron posts used as a means of defence"
+      }
+    ]
+  },
+  "footer_cut_markers": {},
+  "group_text_fixes": {},
+  "group_option_fixes": {},
+  "qa_exceptions": {
+    "20-21": "Choose TWO letters B and D in either order",
+    "26": "Accept jewellery or jewelry"
+  }
+}

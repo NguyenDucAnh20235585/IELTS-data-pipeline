@@ -1,0 +1,2882 @@
+﻿IELTS PIPELINE SOURCE REVIEW
+
+========== pipeline\extract_pdf_layout.py ==========
+
+
+import argparse
+import hashlib
+import json
+import re
+from pathlib import Path
+
+import pymupdf
+
+
+READING_PAGES = list(range(17, 30))
+ANSWER_PAGE = 119
+
+EXPECTED_HEADINGS = {
+    17: r"READING\s+PASSAGE\s+1",
+    21: r"READING\s+PASSAGE\s+2",
+    26: r"READING\s+PASSAGE\s+3",
+}
+
+
+def file_hash(path):
+    digest = hashlib.sha256()
+
+    with open(path, "rb") as file:
+        for chunk in iter(lambda: file.read(1024 * 1024), b""):
+            digest.update(chunk)
+
+    return digest.hexdigest()
+
+
+def extract_page(document, page_number):
+    page = document[page_number - 1]
+
+    text = page.get_text("text", sort=False)
+    raw = page.get_text("dict", sort=False)
+
+    lines = []
+
+    for block_index, block in enumerate(raw["blocks"]):
+        if block.get("type") != 0:
+            continue
+
+        for line_index, line in enumerate(block["lines"]):
+            spans = line.get("spans", [])
+            content = "".join(
+                span.get("text", "") for span in spans
+            )
+
+            if not content.strip():
+                continue
+
+            lines.append({
+                "block_index": block_index,
+                "line_index": line_index,
+                "text": content,
+                "bbox": [
+                    round(v, 2) for v in line["bbox"]
+                ],
+                "spans": [
+                    {
+                        "text": span["text"],
+                        "font": span["font"],
+                        "size": round(span["size"], 2),
+                        "bbox": [
+                            round(v, 2)
+                            for v in span["bbox"]
+                        ],
+                    }
+                    for span in spans
+                ],
+            })
+
+    return {
+        "pdf_page": page_number,
+        "width": round(page.rect.width, 2),
+        "height": round(page.rect.height, 2),
+        "text": text,
+        "lines": lines,
+        "text_chars": len(text.strip()),
+        "word_count": len(page.get_text("words")),
+        "line_count": len(lines),
+        "needs_ocr_review": len(text.strip()) < 100,
+    }
+
+
+def main():
+    parser = argparse.ArgumentParser()
+
+    parser.add_argument(
+        "--pdf",
+        default="Cambridge 21.pdf",
+    )
+    parser.add_argument(
+        "--out",
+        default="output/stage1",
+    )
+
+    args = parser.parse_args()
+
+    pdf_path = Path(args.pdf).resolve()
+    output = Path(args.out).resolve()
+    pages_folder = output / "pages"
+
+    if not pdf_path.is_file():
+        raise FileNotFoundError(pdf_path)
+
+    pages_folder.mkdir(parents=True, exist_ok=True)
+
+    manifest = {
+        "source_file": pdf_path.name,
+        "source_sha256": file_hash(pdf_path),
+        "reading_pages": READING_PAGES,
+        "answer_page": ANSWER_PAGE,
+        "pages": [],
+        "warnings": [],
+    }
+
+    with pymupdf.open(pdf_path) as document:
+        required_pages = max(
+            READING_PAGES + [ANSWER_PAGE]
+        )
+
+        if len(document) < required_pages:
+            raise ValueError(
+                f"PDF has only {len(document)} pages; "
+                f"expected at least {required_pages}"
+            )
+
+        print(f"PDF pages: {len(document)}")
+        print("Extracting Reading Test 1...\n")
+
+        for number in READING_PAGES + [ANSWER_PAGE]:
+            data = extract_page(document, number)
+
+            role = (
+                "answer_key"
+                if number == ANSWER_PAGE
+                else "reading"
+            )
+
+            heading_found = None
+
+            if number in EXPECTED_HEADINGS:
+                normalized = re.sub(
+                    r"\s+", " ", data["text"]
+                ).upper()
+
+                heading_found = bool(
+                    re.search(
+                        EXPECTED_HEADINGS[number],
+                        normalized,
+                    )
+                )
+
+            filename = f"page_{number:03d}"
+
+            (pages_folder / f"{filename}.json").write_text(
+                json.dumps(
+                    data,
+                    ensure_ascii=False,
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+
+            (pages_folder / f"{filename}.txt").write_text(
+                data["text"],
+                encoding="utf-8",
+            )
+
+            page_result = {
+                "page": number,
+                "role": role,
+                "chars": data["text_chars"],
+                "words": data["word_count"],
+                "lines": data["line_count"],
+                "needs_ocr_review": data["needs_ocr_review"],
+                "expected_heading_found": heading_found,
+            }
+
+            manifest["pages"].append(page_result)
+
+            if data["needs_ocr_review"]:
+                manifest["warnings"].append(
+                    f"Page {number}: low text content"
+                )
+
+            if heading_found is False:
+                manifest["warnings"].append(
+                    f"Page {number}: expected heading missing"
+                )
+
+            status = (
+                "REVIEW"
+                if data["needs_ocr_review"]
+                or heading_found is False
+                else "OK"
+            )
+
+            print(
+                f"Page {number:3d} | "
+                f"{data['text_chars']:5d} chars | "
+                f"{data['line_count']:3d} lines | "
+                f"{status}"
+            )
+
+    (output / "manifest.json").write_text(
+        json.dumps(
+            manifest,
+            ensure_ascii=False,
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+
+    print("\n--- RESULT ---")
+    print(f"Pages extracted: {len(manifest['pages'])}")
+    print(f"Warnings: {len(manifest['warnings'])}")
+    print(f"Output: {output}")
+
+    if manifest["warnings"]:
+        print("\nWarnings:")
+        for warning in manifest["warnings"]:
+            print("-", warning)
+
+    print("\nSTAGE 1 COMPLETE - NOT IMPORT READY")
+
+
+if __name__ == "__main__":
+    main()
+
+
+========== pipeline\detect_reading_structure.py ==========
+
+
+import argparse
+import json
+import re
+from pathlib import Path
+
+
+READING_PAGES = range(17, 30)
+
+EXPECTED_GROUPS = [
+    (1, 7), (8, 13),
+    (14, 17), (18, 21), (22, 26),
+    (27, 30), (31, 36), (37, 40),
+]
+
+
+def normalize(text):
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def detect_passage(text):
+    lines = text.splitlines()
+
+    for index, line in enumerate(lines[:12]):
+        match = re.fullmatch(
+            r"(?:READING\s+)?PASSAGE\s+([1-3])",
+            line.strip(),
+            re.IGNORECASE,
+        )
+
+        if not match:
+            continue
+
+        previous = lines[max(0, index - 3):index]
+
+        if (
+            "READING" in line.upper()
+            or any(
+                item.strip().upper() == "READING"
+                for item in previous
+            )
+        ):
+            return int(match.group(1))
+
+    return None
+
+
+def find_group_headers(text):
+    lines = list(re.finditer(
+        r"[^\n]*(?:\n|$)", text
+    ))
+
+    results = []
+
+    pattern = re.compile(
+        r"Questions?\s+(\d{1,2})\s*"
+        r"(?:[-–—]|to|and|&)\s*(\d{1,2})",
+        re.IGNORECASE,
+    )
+
+    range_only = re.compile(
+        r"(\d{1,2})\s*(?:[-–—]|to|and|&)"
+        r"\s*(\d{1,2})",
+        re.IGNORECASE,
+    )
+
+    for index, item in enumerate(lines):
+        value = item.group().strip()
+
+        match = pattern.fullmatch(value)
+        start = item.start()
+        end = item.end()
+
+        if not match and value.lower() in (
+            "question", "questions"
+        ):
+            if index + 1 < len(lines):
+                next_item = lines[index + 1]
+                match = range_only.fullmatch(
+                    next_item.group().strip()
+                )
+                if match:
+                    end = next_item.end()
+
+        if not match:
+            continue
+
+        first = int(match.group(1))
+        last = int(match.group(2))
+
+        if not (1 <= first <= last <= 40):
+            continue
+
+        results.append({
+            "first": first,
+            "last": last,
+            "start": start,
+            "end": end,
+        })
+
+    return results
+
+
+def detect_question_type(text):
+    value = normalize(text).upper()
+
+    if all(
+        term in value
+        for term in ("TRUE", "FALSE", "NOT GIVEN")
+    ):
+        return "TRUE_FALSE_NOT_GIVEN"
+
+    if all(
+        term in value
+        for term in ("YES", "NO", "NOT GIVEN")
+    ):
+        return "YES_NO_NOT_GIVEN"
+
+    if "COMPLETE THE NOTES" in value:
+        return "NOTE_COMPLETION"
+
+    if "COMPLETE THE SUMMARY" in value:
+        if "LIST OF WORDS" in value:
+            return "SUMMARY_WORD_BANK"
+        return "SUMMARY_COMPLETION"
+
+    if "MATCH EACH STATEMENT" in value:
+        return "MATCHING_FEATURES"
+
+    if "WHICH SECTION CONTAINS" in value:
+        return "MATCHING_INFORMATION"
+
+    if "CHOOSE THE CORRECT LETTER" in value:
+        return "MULTIPLE_CHOICE"
+
+    return "UNKNOWN"
+
+
+def load_pages(folder):
+    pages = {}
+
+    for number in READING_PAGES:
+        file = folder / "pages" / f"page_{number:03d}.json"
+
+        if not file.is_file():
+            raise FileNotFoundError(file)
+
+        data = json.loads(
+            file.read_text(encoding="utf-8")
+        )
+
+        if data.get("pdf_page") != number:
+            raise ValueError(
+                f"Page mismatch: {file}"
+            )
+
+        pages[number] = data["text"]
+
+    return pages
+
+
+def build_structure(pages):
+    starts = []
+
+    for number, text in pages.items():
+        passage = detect_passage(text)
+
+        if passage is not None:
+            starts.append((passage, number))
+
+    if [item[0] for item in starts] != [1, 2, 3]:
+        raise ValueError(
+            f"Unexpected passage headings: {starts}"
+        )
+
+    passages = []
+    all_groups = []
+    warnings = []
+
+    for index, (passage_no, start_page) in enumerate(starts):
+        end_page = (
+            starts[index + 1][1] - 1
+            if index + 1 < len(starts)
+            else max(READING_PAGES)
+        )
+
+        body_chunks = []
+        groups = []
+
+        for page_no in range(start_page, end_page + 1):
+            text = pages[page_no]
+            headers = find_group_headers(text)
+
+            if not headers:
+                chunk = {
+                    "pdf_page": page_no,
+                    "raw_text": text,
+                }
+
+                if groups:
+                    groups[-1]["source_chunks"].append(chunk)
+                else:
+                    body_chunks.append(chunk)
+
+                continue
+
+            
+            prefix = text[:headers[0]["start"]].strip()
+
+            if prefix:
+                residue = re.sub(
+                    r"(?im)^\s*(?:Test\s+\d+|Reading)\s*$",
+                    "",
+                    prefix,
+                ).strip()
+
+                if residue:
+                    warnings.append(
+                        f"Page {page_no}: unassigned text before "
+                        f"Q{headers[0]['first']}: {residue[:80]!r}"
+                    )
+
+            for position, header in enumerate(headers):
+                next_start = (
+                    headers[position + 1]["start"]
+                    if position + 1 < len(headers)
+                    else len(text)
+                )
+
+                fragment = text[
+                    header["end"]:next_start
+                ].strip()
+
+                group = {
+                    "number_from": header["first"],
+                    "number_to": header["last"],
+                    "source_pages": [page_no],
+                    "question_type_hint": detect_question_type(
+                        fragment
+                    ),
+                    "question_numbers": list(range(
+                        header["first"],
+                        header["last"] + 1,
+                    )),
+                    "source_chunks": [{
+                        "pdf_page": page_no,
+                        "raw_text": fragment,
+                    }],
+                    "status": "NEEDS_QUESTION_PARSING",
+                }
+
+                groups.append(group)
+                all_groups.append(group)
+
+        for group in groups:
+            group["source_pages"] = sorted(set(
+                item["pdf_page"]
+                for item in group["source_chunks"]
+            ))
+
+            if group["question_type_hint"] == "UNKNOWN":
+                warnings.append(
+                    "Unknown type for Q"
+                    f"{group['number_from']}-"
+                    f"{group['number_to']}"
+                )
+
+        if not body_chunks:
+            warnings.append(
+                f"Passage {passage_no}: no body text"
+            )
+
+        passages.append({
+            "passage_number": passage_no,
+            "source_pages": [
+                item["pdf_page"] for item in body_chunks
+            ],
+            "body_chunks": body_chunks,
+            "question_groups": groups,
+        })
+
+    actual = [
+        (group["number_from"], group["number_to"])
+        for group in all_groups
+    ]
+
+    declared = [
+        n
+        for group in all_groups
+        for n in group["question_numbers"]
+    ]
+
+    if actual != EXPECTED_GROUPS:
+        raise ValueError(
+            "Group ranges differ from expected:\n"
+            f"Actual: {actual}\n"
+            f"Expected: {EXPECTED_GROUPS}"
+        )
+
+    if declared != list(range(1, 41)):
+        raise ValueError(
+            f"Invalid question coverage: {declared}"
+        )
+
+    return {
+        "status": "STRUCTURE_EXTRACTED_NOT_IMPORT_READY",
+        "passages": passages,
+        "summary": {
+            "passages": len(passages),
+            "question_groups": len(all_groups),
+            "declared_question_slots": len(declared),
+            "question_prompts_parsed": False,
+            "warnings": warnings,
+        },
+    }
+
+
+def main():
+    parser = argparse.ArgumentParser()
+
+    parser.add_argument(
+        "--input",
+        default="output/stage1",
+    )
+
+    parser.add_argument(
+        "--out",
+        default="output/stage2",
+    )
+
+    args = parser.parse_args()
+
+    input_folder = Path(args.input)
+    output_folder = Path(args.out)
+
+    pages = load_pages(input_folder)
+    result = build_structure(pages)
+
+    output_folder.mkdir(
+        parents=True, exist_ok=True
+    )
+
+    destination = output_folder / "structure.json"
+
+    destination.write_text(
+        json.dumps(
+            result,
+            ensure_ascii=False,
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+
+    print("\n--- STAGE 2 RESULT ---")
+
+    for passage in result["passages"]:
+        no = passage["passage_number"]
+        body_pages = passage["source_pages"]
+
+        print(
+            f"\nPASSAGE {no} | "
+            f"body pages: {body_pages} | "
+            f"groups: {len(passage['question_groups'])}"
+        )
+
+        for group in passage["question_groups"]:
+            print(
+                f"  Q{group['number_from']:02d}-"
+                f"{group['number_to']:02d} | "
+                f"{group['question_type_hint']} | "
+                f"pages {group['source_pages']}"
+            )
+
+    summary = result["summary"]
+
+    print("\n--- SUMMARY ---")
+    print("Passages:", summary["passages"])
+    print("Groups:", summary["question_groups"])
+    print(
+        "Question slots:",
+        summary["declared_question_slots"],
+    )
+    print("Warnings:", len(summary["warnings"]))
+    print("Output:", destination)
+    print("\nSTAGE 2 COMPLETE - NOT IMPORT READY")
+
+
+if __name__ == "__main__":
+    main()
+
+
+========== pipeline\parse_reading_questions.py ==========
+
+
+import json
+import re
+from collections import Counter
+from pathlib import Path
+
+SOURCE = Path("output/stage2/structure.json")
+OUTPUT = Path("output/stage3/question_candidates_v2.json")
+
+INLINE_TYPES = {
+    "NOTE_COMPLETION",
+    "SUMMARY_COMPLETION",
+    "SUMMARY_WORD_BANK",
+}
+
+GAP_RE = re.compile(
+    r"(?<!\d)(?P<n>\d{1,2})[ \t]*"
+    r"(?:\.(?:[ \t]*\.){2,}|_{3,}|…{2,})"
+)
+
+NUMBER_RE = re.compile(
+    r"^([1-9]|[1-3]\d|40)(?:[.)])?"
+    r"(?:\s+(.+))?$"
+)
+
+LETTER_RE = re.compile(r"^[A-I]$")
+
+
+def compact(value):
+    return re.sub(r"\s+", " ", value).strip()
+
+
+def clean_lines(lines):
+    result = []
+
+    for line in lines:
+        value = line.strip()
+
+        if value.startswith(("➔", "→")):
+            break
+
+        if value:
+            result.append(value)
+
+    while result and re.fullmatch(r"\d{1,3}", result[-1]):
+        result.pop()
+
+    return result
+
+
+def split_questions(lines, first, last):
+    expected = list(range(first, last + 1))
+    starts = []
+    target_index = 0
+
+    for index, line in enumerate(lines):
+        match = NUMBER_RE.fullmatch(line.strip())
+
+        if not match or target_index >= len(expected):
+            continue
+
+        number = int(match.group(1))
+
+        if number != expected[target_index]:
+            continue
+
+        starts.append({
+            "number": number,
+            "line_index": index,
+            "inline_text": match.group(2) or "",
+        })
+
+        target_index += 1
+
+    if len(starts) != len(expected):
+        return None, (
+            f"ROW_MISMATCH expected={expected}, "
+            f"found={[s['number'] for s in starts]}"
+        )
+
+    result = []
+
+    for i, start in enumerate(starts):
+        end = (
+            starts[i + 1]["line_index"]
+            if i + 1 < len(starts)
+            else len(lines)
+        )
+
+        content = []
+
+        if start["inline_text"]:
+            content.append(start["inline_text"])
+
+        content.extend(
+            lines[start["line_index"] + 1:end]
+        )
+
+        result.append({
+            "number": start["number"],
+            "lines": clean_lines(content),
+        })
+
+    return result, None
+
+
+def extract_letter_options(lines, letters):
+    positions = []
+
+    for index, line in enumerate(lines):
+        value = line.strip()
+
+        if LETTER_RE.fullmatch(value):
+            positions.append((index, value))
+
+    if [letter for _, letter in positions] != list(letters):
+        return None, compact("\n".join(lines))
+
+    first_position = positions[0][0]
+    prompt = compact("\n".join(lines[:first_position]))
+    options = []
+
+    for i, (index, letter) in enumerate(positions):
+        end = (
+            positions[i + 1][0]
+            if i + 1 < len(positions)
+            else len(lines)
+        )
+
+        value = compact("\n".join(lines[index + 1:end]))
+
+        if not value:
+            return None, prompt
+
+        options.append({
+            "key": letter,
+            "text": value,
+        })
+
+    return options, prompt
+
+
+def parse_inline(group, raw):
+    first = group["number_from"]
+    last = group["number_to"]
+    kind = group["question_type_hint"]
+    expected = list(range(first, last + 1))
+
+    matches = [
+        m for m in GAP_RE.finditer(raw)
+        if first <= int(m.group("n")) <= last
+    ]
+
+    found = [int(m.group("n")) for m in matches]
+    counts = Counter(found)
+    warnings = []
+
+    if sorted(found) != expected:
+        warnings.append(
+            f"GAP_MISMATCH expected={expected} found={found}"
+        )
+
+    template_source = raw
+    word_bank_raw = None
+
+    if kind == "SUMMARY_WORD_BANK":
+        if matches:
+            after_last_gap = max(m.end() for m in matches)
+
+            bank_start = re.search(
+                r"(?m)^[ \t]*A[ \t]*$",
+                raw[after_last_gap:],
+            )
+
+            if bank_start:
+                cut = after_last_gap + bank_start.start()
+                template_source = raw[:cut]
+                word_bank_raw = raw[cut:].strip()
+            else:
+                warnings.append("WORD_BANK_START_NOT_FOUND")
+
+        warnings.append("WORD_BANK_LAYOUT_REVIEW")
+
+    def replace_gap(match):
+        number = int(match.group("n"))
+
+        if first <= number <= last:
+            return "{{gap:" + str(number) + "}}"
+
+        return match.group(0)
+
+    template = GAP_RE.sub(replace_gap, template_source)
+
+    questions = []
+
+    for number in expected:
+        valid = counts[number] == 1
+
+        questions.append({
+            "number": number,
+            "question_type_hint": kind,
+            "render_mode": "INLINE_GAP",
+            "gap_token": f"{{{{gap:{number}}}}}",
+            "prompt": None,
+            "options": None,
+            "status": (
+                "EXTRACTED_CANDIDATE"
+                if valid and kind != "SUMMARY_WORD_BANK"
+                else "NEEDS_REVIEW"
+            ),
+        })
+
+    return questions, template, word_bank_raw, None, warnings
+
+
+def parse_rows(group, raw):
+    first = group["number_from"]
+    last = group["number_to"]
+    kind = group["question_type_hint"]
+
+    warnings = []
+    shared_options = None
+    question_text = raw
+    bank_text = None
+
+    if kind == "MATCHING_FEATURES":
+        match = re.search(
+            r"(?im)^[ \t]*List[ \t]+of[ \t]+People[ \t]*$",
+            raw,
+        )
+
+        if match:
+            question_text = raw[:match.start()]
+            bank_text = raw[match.end():]
+
+            shared_options, _ = extract_letter_options(
+                clean_lines(bank_text.splitlines()),
+                "ABCD",
+            )
+
+            if shared_options is None:
+                warnings.append("MATCHING_BANK_REVIEW")
+        else:
+            warnings.append("MATCHING_BANK_NOT_FOUND")
+
+    elif kind == "MATCHING_INFORMATION":
+        shared_options = [
+            {"key": c, "text": c}
+            for c in "ABCDEFG"
+        ]
+
+    elif kind == "TRUE_FALSE_NOT_GIVEN":
+        shared_options = [
+            {"key": c, "text": c}
+            for c in ("TRUE", "FALSE", "NOT GIVEN")
+        ]
+
+    elif kind == "YES_NO_NOT_GIVEN":
+        shared_options = [
+            {"key": c, "text": c}
+            for c in ("YES", "NO", "NOT GIVEN")
+        ]
+
+    lines = question_text.splitlines()
+    rows, error = split_questions(lines, first, last)
+
+    if error:
+        warnings.append(error)
+        rows = [
+            {"number": n, "lines": []}
+            for n in range(first, last + 1)
+        ]
+
+    questions = []
+
+    for row in rows:
+        prompt = compact("\n".join(row["lines"]))
+        options = None
+
+        if kind == "MULTIPLE_CHOICE":
+            options, prompt = extract_letter_options(
+                row["lines"],
+                "ABCD",
+            )
+
+            if options is None:
+                warnings.append(
+                    f"Q{row['number']}: MCQ_OPTIONS_REVIEW"
+                )
+
+        valid = bool(prompt)
+
+        if kind == "MULTIPLE_CHOICE":
+            valid = valid and options is not None
+
+        if kind == "MATCHING_FEATURES":
+            valid = valid and shared_options is not None
+
+        questions.append({
+            "number": row["number"],
+            "question_type_hint": kind,
+            "render_mode": "QUESTION_CARD",
+            "prompt": prompt or None,
+            "options": options,
+            "status": (
+                "EXTRACTED_CANDIDATE"
+                if valid else "NEEDS_REVIEW"
+            ),
+        })
+
+    return questions, None, bank_text, shared_options, warnings
+
+
+def main():
+    data = json.loads(
+        SOURCE.read_text(encoding="utf-8")
+    )
+
+    groups = []
+
+    for passage in data["passages"]:
+        for source_group in passage["question_groups"]:
+            raw = "\n".join(
+                chunk["raw_text"]
+                for chunk in source_group["source_chunks"]
+            )
+
+            kind = source_group["question_type_hint"]
+
+            if kind in INLINE_TYPES:
+                parsed = parse_inline(source_group, raw)
+            else:
+                parsed = parse_rows(source_group, raw)
+
+            questions, template, bank, shared, warnings = parsed
+
+            groups.append({
+                "passage_number": passage["passage_number"],
+                "number_from": source_group["number_from"],
+                "number_to": source_group["number_to"],
+                "question_type_hint": kind,
+                "source_pages": source_group["source_pages"],
+                "raw_group_text": raw,
+                "render_template": template,
+                "word_bank_raw": bank,
+                "shared_options": shared,
+                "questions": questions,
+                "warnings": warnings,
+            })
+
+    all_questions = [
+        q for group in groups
+        for q in group["questions"]
+    ]
+
+    numbers = [q["number"] for q in all_questions]
+
+    if numbers != list(range(1, 41)):
+        raise ValueError(
+            f"Invalid question coverage: {numbers}"
+        )
+
+    if len(groups) != 8:
+        raise ValueError(
+            f"Expected 8 groups, found {len(groups)}"
+        )
+
+    result = {
+        "status": "CANDIDATES_NOT_IMPORT_READY",
+        "groups": groups,
+        "question_count": len(all_questions),
+        "answers_mapped": False,
+    }
+
+    OUTPUT.parent.mkdir(parents=True, exist_ok=True)
+
+    OUTPUT.write_text(
+        json.dumps(result, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+    print("\n--- STAGE 3 V2 ---")
+
+    for group in groups:
+        counts = Counter(
+            q["status"]
+            for q in group["questions"]
+        )
+
+        print(
+            f"Q{group['number_from']:02d}-"
+            f"{group['number_to']:02d} | "
+            f"candidates={counts['EXTRACTED_CANDIDATE']} | "
+            f"review={counts['NEEDS_REVIEW']}"
+        )
+
+        for issue in group["warnings"]:
+            print("  WARNING:", issue)
+
+    counts = Counter(
+        q["status"] for q in all_questions
+    )
+
+    print("\n--- SUMMARY ---")
+    print("Groups:", len(groups))
+    print("Questions:", len(all_questions))
+    print("Candidates:", counts["EXTRACTED_CANDIDATE"])
+    print("Needs review:", counts["NEEDS_REVIEW"])
+    print("Output:", OUTPUT)
+    print("\nNOT IMPORT READY")
+
+
+if __name__ == "__main__":
+    main()
+
+
+========== pipeline\map_answer_keys.py ==========
+
+
+import json
+import re
+from pathlib import Path
+
+PAGE = Path("output/stage1/pages/page_119.json")
+QUESTIONS = Path(
+    "output/stage3/question_candidates_reviewed.json"
+)
+OUT = Path("output/stage4")
+
+REFERENCE_VALUES = (
+    "mining|education|notes|journals|Venice|canteen|friends|"
+    "TRUE|NOT GIVEN|FALSE|NOT GIVEN|TRUE|TRUE|"
+    "C|B|A|G|breath|questionnaire|wellbeing|depression|"
+    "C|A|B|D|C|B|A|C|A|H|E|I|A|G|C|"
+    "YES|NOT GIVEN|NO|YES"
+).split("|")
+
+
+def normalize(value):
+    value = re.sub(r"\s+", " ", str(value)).strip().upper()
+    return re.sub(r"\bNOT\s*GIVEN\b", "NOT GIVEN", value)
+
+
+REFERENCE = {
+    index: normalize(value)
+    for index, value in enumerate(REFERENCE_VALUES, 1)
+}
+
+NUMBER_LINE = re.compile(
+    r"^([1-9]|[1-3]\d|40)(?:[ \t]+(.+))?$"
+)
+
+
+def read_json(path):
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def extract_answers(page):
+    lines = [
+        line.strip()
+        for line in page["text"].splitlines()
+        if line.strip()
+    ]
+
+    start = next(
+        (
+            i for i, line in enumerate(lines)
+            if line.upper() == "READING"
+        ),
+        None,
+    )
+
+    if start is None:
+        raise ValueError("READING heading not found")
+
+        # Giữ lại toàn bộ text sau tiêu đề READING.
+    # Thứ tự PDF hai cột có thể khác thứ tự hiển thị.
+    # Bộ kiểm tra phía sau sẽ chặn số câu trùng hoặc đáp án sai.
+    lines = lines[start + 1:]
+    answers = {}
+    duplicates = []
+
+    for index, line in enumerate(lines):
+        match = NUMBER_LINE.fullmatch(line)
+
+        if match is None:
+            continue
+
+        number = int(match.group(1))
+        value = (match.group(2) or "").strip()
+
+        if not value and index + 1 < len(lines):
+            next_line = lines[index + 1]
+
+            if NUMBER_LINE.fullmatch(next_line) is None:
+                value = next_line
+
+        if not value:
+            continue
+
+        if number in answers:
+            duplicates.append(number)
+        else:
+            answers[number] = normalize(value)
+
+    return answers, sorted(set(duplicates))
+
+
+def validate_pdf_answers(answers, duplicates):
+    issues = []
+
+    if duplicates:
+        issues.append(f"Duplicate answers: {duplicates}")
+
+    missing = sorted(set(range(1, 41)) - set(answers))
+    extra = sorted(set(answers) - set(range(1, 41)))
+
+    if missing:
+        issues.append(f"Missing answers: {missing}")
+
+    if extra:
+        issues.append(f"Unexpected numbers: {extra}")
+
+    for number in range(1, 41):
+        actual = answers.get(number)
+        expected = REFERENCE[number]
+
+        if actual is not None and actual != expected:
+            issues.append(
+                f"Q{number}: extracted={actual!r}, "
+                f"PDF_reference={expected!r}"
+            )
+
+    return issues
+
+
+def validate_and_map(data, answers):
+    issues = []
+    all_questions = []
+
+    TEXT_TYPES = {
+        "NOTE_COMPLETION",
+        "SUMMARY_COMPLETION",
+    }
+
+    for group in data["groups"]:
+        kind = group["question_type_hint"]
+        shared = group.get("shared_options") or []
+        template = group.get("render_template") or ""
+
+        if kind == "SUMMARY_WORD_BANK":
+            keys = [item["key"] for item in shared]
+
+            if keys != list("ABCDEFGHI"):
+                issues.append(
+                    "Q31-36: invalid word bank A-I"
+                )
+
+        for question in group["questions"]:
+            number = question["number"]
+            all_questions.append(question)
+
+            if question["status"] not in (
+                "EXTRACTED_CANDIDATE",
+                "REVIEWED_CANDIDATE",
+            ):
+                issues.append(
+                    f"Q{number}: question is not ready"
+                )
+
+            answer = answers[number]
+
+            if kind in TEXT_TYPES:
+                if len(answer.split()) > 1:
+                    issues.append(
+                        f"Q{number}: exceeds one word"
+                    )
+
+                question["answer_format"] = "TEXT"
+                question["correct_answer"] = {
+                    "accepted": [answer.lower()]
+                }
+                question["config"] = {"max_words": 1}
+
+            else:
+                options = (
+                    question.get("options") or shared
+                )
+
+                allowed = {
+                    normalize(item["key"])
+                    for item in options
+                }
+
+                if not allowed:
+                    issues.append(
+                        f"Q{number}: missing choice options"
+                    )
+                elif answer not in allowed:
+                    issues.append(
+                        f"Q{number}: answer {answer!r} "
+                        f"not in {sorted(allowed)}"
+                    )
+
+                question["answer_format"] = "CHOICE"
+                question["correct_answer"] = {
+                    "choice": answer
+                }
+
+            if question.get("render_mode") == "INLINE_GAP":
+                token = question.get("gap_token")
+
+                if not token or template.count(token) != 1:
+                    issues.append(
+                        f"Q{number}: invalid gap token"
+                    )
+            elif not question.get("prompt"):
+                issues.append(
+                    f"Q{number}: missing prompt"
+                )
+
+            question["source_answer_page"] = 119
+
+    numbers = [q["number"] for q in all_questions]
+
+    if numbers != list(range(1, 41)):
+        issues.append("Question coverage is not 1-40")
+
+    if len(data["groups"]) != 8:
+        issues.append("Expected exactly 8 groups")
+
+    return issues
+
+
+def main():
+    if len(REFERENCE) != 40:
+        raise ValueError("Invalid reference answer count")
+
+    if not PAGE.is_file():
+        raise FileNotFoundError(PAGE)
+
+    if not QUESTIONS.is_file():
+        raise FileNotFoundError(QUESTIONS)
+
+    page = read_json(PAGE)
+    data = read_json(QUESTIONS)
+
+    if page.get("pdf_page") != 119:
+        raise ValueError("Wrong answer key page")
+
+    OUT.mkdir(parents=True, exist_ok=True)
+
+    answers, duplicates = extract_answers(page)
+    extraction_issues = validate_pdf_answers(
+        answers, duplicates
+    )
+
+    probe = {
+        "source_page": 119,
+        "extracted_count": len(answers),
+        "answers": {
+            str(n): answers[n]
+            for n in sorted(answers)
+        },
+        "issues": extraction_issues,
+    }
+
+    (OUT / "answer_probe.json").write_text(
+        json.dumps(probe, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+    print("\n--- ANSWER EXTRACTION ---")
+    print("Extracted:", len(answers), "/40")
+    print("Duplicates:", duplicates)
+    print("Extraction issues:", len(extraction_issues))
+
+    for issue in extraction_issues:
+        print("  ERROR:", issue)
+
+    if extraction_issues:
+        print("\nSTOPPED: PDF answer extraction requires review")
+        print("Diagnostic:", OUT / "answer_probe.json")
+        raise SystemExit(1)
+
+    mapping_issues = validate_and_map(data, answers)
+
+    print("\n--- ANSWER MAPPING ---")
+    print("Question records:", sum(
+        len(g["questions"]) for g in data["groups"]
+    ))
+    print("Mapping issues:", len(mapping_issues))
+
+    for issue in mapping_issues:
+        print("  ERROR:", issue)
+
+    if mapping_issues:
+        print("\nSTOPPED: Answer mapping requires review")
+        raise SystemExit(1)
+
+    data["status"] = "ANSWER_MAPPED_QA_PENDING"
+    data["answers_mapped"] = True
+    data["answer_source_pdf_page"] = 119
+
+    destination = OUT / "reading_test1_mapped.json"
+
+    destination.write_text(
+        json.dumps(data, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+    print("\n--- STAGE 4 SUMMARY ---")
+    print("Groups:", len(data["groups"]))
+    print("Answers:", len(answers))
+    print("Reference mismatches: 0")
+    print("Mapping issues: 0")
+    print("Output:", destination)
+    print("\nSTAGE 4 PASS - CONTENT QA STILL REQUIRED")
+
+
+if __name__ == "__main__":
+    main()
+
+
+========== review\apply_question_reviews.py ==========
+
+
+import json
+import re
+from pathlib import Path
+
+SOURCE = Path("output/stage3/question_candidates_v2.json")
+REVIEW = Path("stage3_review.json")
+DEST = Path("output/stage3/question_candidates_reviewed.json")
+
+
+def load(path):
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def main():
+    data = load(SOURCE)
+    review = load(REVIEW)
+
+    patches = review["question_groups"]
+    applied = set()
+
+    for patch in patches:
+        first, last = patch["from"], patch["to"]
+        group_id = (first, last)
+
+        group = next(
+            (
+                g for g in data["groups"]
+                if (g["number_from"], g["number_to"]) == group_id
+            ),
+            None,
+        )
+
+        if group is None:
+            raise ValueError(f"Group not found: {group_id}")
+
+        if group_id in applied:
+            raise ValueError(f"Duplicate review: {group_id}")
+
+        if group["question_type_hint"] != "SUMMARY_WORD_BANK":
+            raise ValueError(f"Unexpected group type: {group_id}")
+
+        if patch["source_pdf_page"] not in group["source_pages"]:
+            raise ValueError(f"Source page mismatch: {group_id}")
+
+        match = re.search(
+            r"list of words,\s*([A-Z])\s*[-–]\s*([A-Z])",
+            group["raw_group_text"],
+            re.IGNORECASE,
+        )
+
+        if not match:
+            raise ValueError("Cannot determine option range")
+
+        expected = [
+            chr(n)
+            for n in range(
+                ord(match.group(1).upper()),
+                ord(match.group(2).upper()) + 1,
+            )
+        ]
+
+        options = patch["options"]
+        keys = [option["key"] for option in options]
+
+        if keys != expected:
+            raise ValueError(
+                f"Invalid option keys: {keys}, expected {expected}"
+            )
+
+        if any(not option["text"].strip() for option in options):
+            raise ValueError("Empty option text")
+
+        group["shared_options"] = options
+        group["review_source_page"] = patch["source_pdf_page"]
+        group["review_method"] = "PDF_VISUAL_REVIEW"
+
+        group["warnings"] = [
+            warning for warning in group["warnings"]
+            if warning != "WORD_BANK_LAYOUT_REVIEW"
+        ]
+
+        for question in group["questions"]:
+            token = question.get("gap_token")
+
+            if not token or token not in (group["render_template"] or ""):
+                raise ValueError(
+                    f"Missing gap token for Q{question['number']}"
+                )
+
+            question["status"] = "REVIEWED_CANDIDATE"
+            question["answer_format_hint"] = "CHOICE"
+
+        applied.add(group_id)
+
+    questions = [
+        question
+        for group in data["groups"]
+        for question in group["questions"]
+    ]
+
+    numbers = [q["number"] for q in questions]
+
+    if len(data["groups"]) != 8 or numbers != list(range(1, 41)):
+        raise ValueError("Invalid group or question coverage")
+
+    unresolved = [
+        q["number"] for q in questions
+        if q["status"] not in (
+            "EXTRACTED_CANDIDATE",
+            "REVIEWED_CANDIDATE",
+        )
+    ]
+
+    warnings = [
+        warning
+        for group in data["groups"]
+        for warning in group["warnings"]
+    ]
+
+    data["status"] = "REVIEWED_CANDIDATES_NOT_IMPORT_READY"
+    data["answers_mapped"] = False
+
+    DEST.parent.mkdir(parents=True, exist_ok=True)
+    DEST.write_text(
+        json.dumps(data, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+    print("\n--- STAGE 3 REVIEW ---")
+    print("Groups:", len(data["groups"]))
+    print("Question records:", len(questions))
+    print("Extracted candidates:", sum(
+        q["status"] == "EXTRACTED_CANDIDATE"
+        for q in questions
+    ))
+    print("Reviewed candidates:", sum(
+        q["status"] == "REVIEWED_CANDIDATE"
+        for q in questions
+    ))
+    print("Unresolved questions:", unresolved)
+    print("Remaining warnings:", warnings)
+    print("Output:", DEST)
+    print("\nNOT IMPORT READY - ANSWER MAPPING REQUIRED")
+
+
+if __name__ == "__main__":
+    main()
+
+
+========== review\validate_reading_dataset.py ==========
+
+
+import json
+import re
+from pathlib import Path
+
+STRUCTURE = Path("output/stage2/structure.json")
+MAPPED = Path("output/stage4/reading_test1_mapped.json")
+OUT = Path("output/stage5")
+
+SPEC = [
+    (1, 7, "NOTE_COMPLETION", 19),
+    (8, 13, "TRUE_FALSE_NOT_GIVEN", 20),
+    (14, 17, "MATCHING_INFORMATION", 23),
+    (18, 21, "SUMMARY_COMPLETION", 24),
+    (22, 26, "MATCHING_FEATURES", 25),
+    (27, 30, "MULTIPLE_CHOICE", 28),
+    (31, 36, "SUMMARY_WORD_BANK", 29),
+    (37, 40, "YES_NO_NOT_GIVEN", 29),
+]
+
+INLINE = {
+    "NOTE_COMPLETION",
+    "SUMMARY_COMPLETION",
+    "SUMMARY_WORD_BANK",
+}
+
+CHOICES = {
+    "TRUE_FALSE_NOT_GIVEN": ["TRUE", "FALSE", "NOT GIVEN"],
+    "YES_NO_NOT_GIVEN": ["YES", "NO", "NOT GIVEN"],
+    "MATCHING_INFORMATION": list("ABCDEFG"),
+    "MATCHING_FEATURES": list("ABCD"),
+    "SUMMARY_WORD_BANK": list("ABCDEFGHI"),
+    "MULTIPLE_CHOICE": list("ABCD"),
+}
+
+
+def load(path):
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def compact(value):
+    return re.sub(r"\s+", " ", value or "").strip()
+
+
+def main():
+    structure = load(STRUCTURE)
+    data = load(MAPPED)
+
+    errors = []
+    warnings = []
+    review = ["# Cambridge 21 Reading Test 1 — Content QA", ""]
+
+    if not data.get("answers_mapped"):
+        errors.append("Answers have not been mapped")
+
+    passages = structure.get("passages", [])
+    groups = data.get("groups", [])
+
+    if len(passages) != 3:
+        errors.append(f"Expected 3 passages, found {len(passages)}")
+
+    if len(groups) != 8:
+        errors.append(f"Expected 8 groups, found {len(groups)}")
+
+    # Check passage content.
+    for passage in passages:
+        number = passage["passage_number"]
+
+        body = "\n".join(
+            chunk["raw_text"]
+            for chunk in passage["body_chunks"]
+        )
+
+        pages = passage.get("source_pages", [])
+
+        if len(compact(body)) < 1500:
+            errors.append(
+                f"Passage {number}: suspiciously short body"
+            )
+
+        review.extend([
+            f"## Passage {number}",
+            f"PDF pages: {pages}",
+            "",
+            "### Extracted passage",
+            "",
+            body,
+            "",
+        ])
+
+    all_numbers = []
+
+    # Check each question group.
+    for first, last, expected_type, expected_page in SPEC:
+        matches = [
+            g for g in groups
+            if (g["number_from"], g["number_to"]) == (first, last)
+        ]
+
+        if len(matches) != 1:
+            errors.append(
+                f"Q{first}-{last}: expected one group, found {len(matches)}"
+            )
+            continue
+
+        group = matches[0]
+        kind = group["question_type_hint"]
+        questions = group["questions"]
+        template = group.get("render_template") or ""
+
+        if kind != expected_type:
+            errors.append(
+                f"Q{first}-{last}: wrong type {kind}"
+            )
+
+        if group.get("source_pages") != [expected_page]:
+            warnings.append(
+                f"Q{first}-{last}: unexpected source pages "
+                f"{group.get('source_pages')}"
+            )
+
+        if len(questions) != last - first + 1:
+            errors.append(
+                f"Q{first}-{last}: wrong question count"
+            )
+
+        if group.get("warnings"):
+            errors.append(
+                f"Q{first}-{last}: unresolved group warnings"
+            )
+
+        review.extend([
+            f"## Questions {first}-{last}",
+            f"Type: {kind}",
+            f"PDF page: {expected_page}",
+            "",
+        ])
+
+        if kind in INLINE:
+            tokens = [
+                int(n) for n in re.findall(
+                    r"\{\{gap:(\d{1,2})\}\}", template
+                )
+            ]
+
+            if tokens != list(range(first, last + 1)):
+                errors.append(
+                    f"Q{first}-{last}: incorrect gap sequence {tokens}"
+                )
+
+            review.extend([
+                "### Completion template",
+                "",
+                template,
+                "",
+            ])
+
+        shared = group.get("shared_options") or []
+
+        if shared:
+            review.extend(["### Shared options", ""])
+
+            for option in shared:
+                review.append(
+                    f"- {option['key']}: {option['text']}"
+                )
+
+            review.append("")
+
+        for question in questions:
+            n = question["number"]
+            all_numbers.append(n)
+
+            prompt = compact(question.get("prompt"))
+            answer = question.get("correct_answer") or {}
+            answer_format = question.get("answer_format")
+            options = question.get("options") or shared
+
+            if question.get("status") not in (
+                "EXTRACTED_CANDIDATE",
+                "REVIEWED_CANDIDATE",
+            ):
+                errors.append(f"Q{n}: unresolved question")
+
+            if kind in INLINE:
+                token = f"{{{{gap:{n}}}}}"
+
+                if template.count(token) != 1:
+                    errors.append(f"Q{n}: missing or duplicate gap")
+
+                if question.get("render_mode") != "INLINE_GAP":
+                    errors.append(f"Q{n}: wrong render mode")
+            else:
+                if not prompt:
+                    errors.append(f"Q{n}: missing prompt")
+
+                if question.get("render_mode") != "QUESTION_CARD":
+                    errors.append(f"Q{n}: wrong render mode")
+
+            if kind in ("NOTE_COMPLETION", "SUMMARY_COMPLETION"):
+                accepted = answer.get("accepted", [])
+
+                if answer_format != "TEXT" or not accepted:
+                    errors.append(f"Q{n}: invalid text answer")
+                elif any(
+                    len(compact(value).split()) > 1
+                    for value in accepted
+                ):
+                    errors.append(f"Q{n}: answer exceeds one word")
+
+            else:
+                expected_keys = CHOICES.get(kind, [])
+                actual_keys = [o["key"] for o in options]
+
+                if actual_keys != expected_keys:
+                    errors.append(
+                        f"Q{n}: option keys mismatch {actual_keys}"
+                    )
+
+                if any(
+                    not compact(o.get("text"))
+                    for o in options
+                ):
+                    errors.append(f"Q{n}: empty option text")
+
+                choice = answer.get("choice")
+
+                if (
+                    answer_format != "CHOICE"
+                    or choice not in expected_keys
+                ):
+                    errors.append(f"Q{n}: invalid choice answer")
+
+            # Detect obvious PDF footer contamination.
+            if re.search(
+                r"➔|→|\bp\.\s*118\b",
+                prompt,
+                re.IGNORECASE,
+            ):
+                warnings.append(
+                    f"Q{n}: possible PDF footer in prompt"
+                )
+
+            review.extend([
+                f"### Q{n}",
+                "",
+                f"Prompt: {prompt or '[INLINE GAP]'}",
+                "",
+            ])
+
+            if question.get("options"):
+                for option in question["options"]:
+                    review.append(
+                        f"- {option['key']}: {option['text']}"
+                    )
+
+                review.append("")
+
+            review.append(
+                "Answer: " + json.dumps(
+                    answer, ensure_ascii=False
+                )
+            )
+            review.append("")
+
+        # OCR artifacts requiring visual verification.
+        searchable = template + "\n" + group.get(
+            "raw_group_text", ""
+        )
+
+        if re.search(r"\bofthe\b", searchable, re.IGNORECASE):
+            warnings.append(
+                f"Q{first}-{last}: suspicious joined word 'ofthe'"
+            )
+
+    if all_numbers != list(range(1, 41)):
+        errors.append(
+            f"Question numbering invalid: {all_numbers}"
+        )
+
+    report = {
+        "status": (
+            "CONTENT_REVIEW_REQUIRED"
+            if not errors else "BLOCKED"
+        ),
+        "passages": len(passages),
+        "groups": len(groups),
+        "question_records": len(all_numbers),
+        "errors": errors,
+        "warnings": warnings,
+        "manual_pdf_review_required": True,
+    }
+
+    OUT.mkdir(parents=True, exist_ok=True)
+
+    (OUT / "qa_report.json").write_text(
+        json.dumps(report, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+    (OUT / "qa_review.md").write_text(
+        "\n".join(review),
+        encoding="utf-8",
+    )
+
+    print("\n--- STAGE 5 CONTENT QA ---")
+    print("Passages:", len(passages))
+    print("Groups:", len(groups))
+    print("Question records:", len(all_numbers))
+    print("Errors:", len(errors))
+    print("Warnings:", len(warnings))
+
+    for error in errors:
+        print("  ERROR:", error)
+
+    for warning in warnings:
+        print("  WARNING:", warning)
+
+    print("\nReport:", OUT / "qa_report.json")
+    print("Review:", OUT / "qa_review.md")
+    print("Status:", report["status"])
+    print("\nMANUAL PDF REVIEW REQUIRED BEFORE IMPORT")
+
+
+if __name__ == "__main__":
+    main()
+
+
+========== review\finalize_reading_dataset.py ==========
+
+
+import copy
+import json
+import re
+from pathlib import Path
+
+STRUCTURE = Path("output/stage2/structure.json")
+MAPPED = Path("output/stage4/reading_test1_mapped.json")
+DEST = Path("output/stage6/reading_test1_demo.json")
+
+TITLES = {
+    1: "The Davies Sisters",
+    2: "Why we need silence",
+    3: "Book review: The World of Sugar by",
+}
+
+PASSAGE_FIXES = {
+    1: {
+        "We lmow": "We know",
+        "contemporaiy": "contemporary",
+        "well-lmown": "well-known",
+        "Provenc;al": "Provençal",
+        "Franc;ois": "François",
+        "·while": "While",
+    },
+    2: {
+        "I-hour float": "1-hour float",
+    },
+    3: {
+        "UlbeBosma": "Ulbe Bosma",
+    },
+}
+
+INLINE_TYPES = {
+    "NOTE_COMPLETION",
+    "SUMMARY_COMPLETION",
+    "SUMMARY_WORD_BANK",
+}
+
+changes = []
+
+
+def load(path):
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def replace_known(text, fixes, location):
+    for old, new in fixes.items():
+        count = text.count(old)
+        if count:
+            text = text.replace(old, new)
+            changes.append({
+                "location": location,
+                "old": old,
+                "new": new,
+                "count": count,
+            })
+    return text
+
+
+def remove_page_noise(text, printed_pages):
+    text = re.sub(
+        r"(?m)^\s*(?:Test 1|Reading|READING)\s*$",
+        "",
+        text,
+    )
+
+    for number in printed_pages:
+        text = re.sub(
+            rf"(?m)^[ \t]*{number}[ \t]*$",
+            "",
+            text,
+        )
+
+    return re.sub(r"\n{3,}", "\n\n", text).strip()
+
+
+def clean_passage(passage):
+    number = passage["passage_number"]
+    pages = passage["source_pages"]
+
+    raw = "\n".join(
+        chunk["raw_text"]
+        for chunk in passage["body_chunks"]
+    )
+
+    title = TITLES[number]
+    position = raw.find(title)
+
+    if position < 0:
+        raise ValueError(
+            f"Passage {number}: title not found"
+        )
+
+    content = raw[position:]
+
+    content = replace_known(
+        content,
+        PASSAGE_FIXES[number],
+        f"Passage {number}",
+    )
+
+    glossary = []
+
+    if number == 1:
+        glossary = [
+            {
+                "term": "philanthropic",
+                "definition": (
+                    "seeking to promote the welfare of others, "
+                    "often by charitable funding"
+                ),
+            },
+            {
+                "term": "Old Master",
+                "definition": (
+                    "a highly respected artist of great skill "
+                    "who worked in Europe before about 1800"
+                ),
+            },
+            {
+                "term": "Impressionist",
+                "definition": (
+                    "an artist with a style of painting that "
+                    "developed in France in the late 1800s"
+                ),
+            },
+        ]
+
+        content = re.sub(
+            r"(?m)^[ \t]*•{1,2}[ \t]*"
+            r"(?:philanthropic|Old Master):[^\n]*\n?",
+            "",
+            content,
+        )
+
+        # Remove corrupted footnote tail from PDF extraction.
+        content = re.sub(
+            r"(?s)\*\*\* Impressionist:.*$",
+            "",
+            content,
+        )
+
+    content = remove_page_noise(
+        content,
+        [page - 1 for page in pages],
+    )
+
+    return {
+        "number": number,
+        "title": (
+            "Book review: The World of Sugar by Ulbe Bosma"
+            if number == 3 else title
+        ),
+        "content": content,
+        "glossary": glossary,
+        "source_pages": pages,
+    }
+
+
+def clean_group(group):
+    result = copy.deepcopy(group)
+    first = result["number_from"]
+    last = result["number_to"]
+    kind = result["question_type_hint"]
+
+    raw = result.get("raw_group_text") or ""
+
+    if kind in INLINE_TYPES:
+        template = result.get("render_template") or ""
+
+        if not template:
+            raise ValueError(
+                f"Q{first}-{last}: missing template"
+            )
+
+        if first == 5 or (first <= 5 <= last):
+            template = re.sub(
+                r"(\{\{gap:5\}\})[ \t]*\n"
+                r"[ \t]*\.{2,}",
+                r"\1",
+                template,
+            )
+
+        if first == 31:
+            template = replace_known(
+                template,
+                {"ofthe": "of the"},
+                "Q31-36",
+            )
+
+        # Join punctuation accidentally separated from gaps.
+        template = re.sub(
+            r"(\{\{gap:\d+\}\})[ \t]*\n[ \t]*([,.])",
+            r"\1\2",
+            template,
+        )
+
+        template = remove_page_noise(
+            template,
+            [page - 1 for page in result["source_pages"]],
+        )
+
+        result["render_template"] = template
+        result["instructions"] = None
+
+    else:
+        match = re.search(
+            rf"(?m)^[ \t]*{first}[ \t]*$",
+            raw,
+        )
+
+        if not match:
+            raise ValueError(
+                f"Q{first}-{last}: instructions boundary missing"
+            )
+
+        result["instructions"] = raw[:match.start()].strip()
+
+    if first == 22:
+        options = result.get("shared_options") or []
+
+        for option in options:
+            if option["key"] == "D":
+                option["text"] = "Eric Pfeifer"
+                changes.append({
+                    "location": "Q22-26",
+                    "old": "Eric pfeifer",
+                    "new": "Eric Pfeifer",
+                    "count": 1,
+                })
+
+    # Preserve only fields intended for display and mapping.
+    result.pop("raw_group_text", None)
+    result.pop("word_bank_raw", None)
+
+    return result
+
+
+def validate(data):
+    passages = data["passages"]
+
+    if len(passages) != 3:
+        raise ValueError("Expected 3 passages")
+
+    groups = [
+        group
+        for passage in passages
+        for group in passage["question_groups"]
+    ]
+
+    if len(groups) != 8:
+        raise ValueError("Expected 8 groups")
+
+    questions = [
+        question
+        for group in groups
+        for question in group["questions"]
+    ]
+
+    numbers = [q["number"] for q in questions]
+
+    if numbers != list(range(1, 41)):
+        raise ValueError(
+            f"Invalid question numbers: {numbers}"
+        )
+
+    for passage in passages:
+        if len(passage["content"]) < 1500:
+            raise ValueError(
+                f"Passage {passage['number']} too short"
+            )
+
+    for group in groups:
+        template = group.get("render_template") or ""
+        kind = group["question_type_hint"]
+        shared = group.get("shared_options") or []
+
+        for question in group["questions"]:
+            number = question["number"]
+            answer = question.get("correct_answer") or {}
+
+            if kind in INLINE_TYPES:
+                token = f"{{{{gap:{number}}}}}"
+
+                if template.count(token) != 1:
+                    raise ValueError(
+                        f"Q{number}: invalid gap"
+                    )
+            elif not question.get("prompt"):
+                raise ValueError(
+                    f"Q{number}: missing prompt"
+                )
+
+            if question["answer_format"] == "CHOICE":
+                options = question.get("options") or shared
+                allowed = {o["key"] for o in options}
+
+                if answer.get("choice") not in allowed:
+                    raise ValueError(
+                        f"Q{number}: invalid choice"
+                    )
+            elif not answer.get("accepted"):
+                raise ValueError(
+                    f"Q{number}: missing text answer"
+                )
+
+    display_text = "\n".join(
+        p["content"] for p in passages
+    ) + "\n" + "\n".join(
+        g.get("render_template") or ""
+        for g in groups
+    )
+
+    for artifact in (
+        "We lmow",
+        "contemporaiy",
+        "well-lmown",
+        "Provenc;al",
+        "Franc;ois",
+        "UlbeBosma",
+        "ofthe",
+    ):
+        if artifact in display_text:
+            raise ValueError(
+                f"Unfixed text artifact: {artifact}"
+            )
+
+    return len(groups), len(questions)
+
+
+def main():
+    structure = load(STRUCTURE)
+    mapped = load(MAPPED)
+
+    if mapped.get("answers_mapped") is not True:
+        raise ValueError("Answer mapping not complete")
+
+    passages = [
+        clean_passage(p)
+        for p in structure["passages"]
+    ]
+
+    for passage in passages:
+        number = passage["number"]
+
+        groups = [
+            clean_group(group)
+            for group in mapped["groups"]
+            if group["passage_number"] == number
+        ]
+
+        passage["question_groups"] = groups
+
+    result = {
+        "test": "Cambridge 21 Reading Test 1",
+        "status": "CONTENT_PATCHED_PENDING_PREVIEW",
+        "passages": passages,
+        "answer_source_page": 119,
+    }
+
+    groups_count, questions_count = validate(result)
+
+    DEST.parent.mkdir(parents=True, exist_ok=True)
+
+    DEST.write_text(
+        json.dumps(result, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+    report_path = DEST.parent / "content_fixes.json"
+
+    report_path.write_text(
+        json.dumps(changes, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+    print("\n--- FINAL CONTENT CHECK ---")
+    print("Passages:", len(passages))
+    print("Groups:", groups_count)
+    print("Questions:", questions_count)
+    print("Recorded text corrections:", len(changes))
+    print("Output:", DEST)
+    print("Fix report:", report_path)
+    print("\nCONTENT PATCHED - PREVIEW STILL REQUIRED")
+
+
+if __name__ == "__main__":
+    main()
+
+
+========== importers\import_cambridge21_reading_test1.py ==========
+
+
+import argparse
+import os
+import re
+import json
+import hashlib
+from pathlib import Path
+
+SOURCE = Path("output/stage6/reading_test1_demo.json")
+TITLE = "Cambridge IELTS 21 - Reading Test 1"
+
+TYPE_MAP = {
+    "NOTE_COMPLETION": "note_completion",
+    "TRUE_FALSE_NOT_GIVEN": "true_false_not_given",
+    "MATCHING_INFORMATION": "matching_information",
+    "SUMMARY_COMPLETION": "summary_completion",
+    "MATCHING_FEATURES": "matching_features",
+    "MULTIPLE_CHOICE": "mcq_single",
+    "SUMMARY_WORD_BANK": "summary_completion",
+    "YES_NO_NOT_GIVEN": "yes_no_not_given",
+}
+
+INLINE_TYPES = {
+    "NOTE_COMPLETION",
+    "SUMMARY_COMPLETION",
+    "SUMMARY_WORD_BANK",
+}
+
+
+def compact(value):
+    return re.sub(r"\s+", " ", value).strip()
+
+
+def clean_passage(passage):
+    content = passage["content"].strip()
+    title = passage["title"]
+
+    if content.startswith(title):
+        content = content[len(title):].strip()
+
+    if passage["number"] == 3:
+        content = re.sub(
+            r"^Book review:\s*The World of Sugar by"
+            r"\s+Ulbe Bosma\s*",
+            "",
+            content,
+            count=1,
+        )
+
+    # Remaining confirmed PDF extraction error.
+    content = content.replace(
+        "we lmow also", "we know also"
+    )
+
+    if "lmow" in content:
+        raise ValueError(
+            f"Unresolved OCR artifact in Passage "
+            f"{passage['number']}"
+        )
+
+    glossary = passage.get("glossary") or []
+
+    if glossary:
+        content += "\n\nGlossary:\n"
+        content += "\n".join(
+            f"{item['term']}: {item['definition']}"
+            for item in glossary
+        )
+
+    if len(content) < 1500:
+        raise ValueError("Suspiciously short passage")
+
+    return content
+
+
+def prepare_group(group):
+    kind = group["question_type_hint"]
+
+    if kind not in TYPE_MAP:
+        raise ValueError(f"Unsupported type: {kind}")
+
+    first = group["number_from"]
+    last = group["number_to"]
+
+    shared = group.get("shared_options") or []
+    template = group.get("render_template") or ""
+
+    instructions = group.get("instructions")
+    content = None
+
+    if kind in INLINE_TYPES:
+        if not template:
+            raise ValueError(
+                f"Q{first}-{last}: missing template"
+            )
+
+        lines = template.splitlines()
+        count = 2 if kind == "SUMMARY_WORD_BANK" else 3
+
+        instructions = compact("\n".join(lines[:count]))
+        content = "\n".join(lines[count:]).strip()
+
+        # Demo presentation: numbered blanks appear in
+        # the group content; answers use question cards.
+        for n in range(first, last + 1):
+            token = "{{gap:" + str(n) + "}}"
+
+            if content.count(token) != 1:
+                raise ValueError(
+                    f"Q{n}: missing or duplicate gap"
+                )
+
+            content = content.replace(
+                token, f"[{n}: ______]"
+            )
+
+    prepared_questions = []
+
+    for position, q in enumerate(group["questions"], 1):
+        n = q["number"]
+
+        if n != first + position - 1:
+            raise ValueError(f"Question order error: Q{n}")
+
+        answer_format = q["answer_format"].lower()
+
+        if answer_format not in ("text", "choice"):
+            raise ValueError(
+                f"Q{n}: invalid answer format"
+            )
+
+        if q.get("render_mode") == "INLINE_GAP":
+            unit = (
+                "notes" if kind == "NOTE_COMPLETION"
+                else "summary"
+            )
+
+            if answer_format == "choice":
+                prompt = (
+                    f"Choose the correct letter for "
+                    f"blank {n} in the {unit} above."
+                )
+            else:
+                prompt = (
+                    f"Enter ONE WORD ONLY for blank "
+                    f"{n} in the {unit} above."
+                )
+        else:
+            prompt = compact(q.get("prompt") or "")
+
+        if not prompt:
+            raise ValueError(f"Q{n}: empty prompt")
+
+        options = q.get("options") or shared or None
+        answer = q["correct_answer"]
+
+        if answer_format == "choice":
+            if not isinstance(options, list) or not options:
+                raise ValueError(
+                    f"Q{n}: missing choice options"
+                )
+
+            keys = {o["key"] for o in options}
+
+            if answer.get("choice") not in keys:
+                raise ValueError(
+                    f"Q{n}: answer not in options"
+                )
+        else:
+            accepted = answer.get("accepted")
+
+            if not isinstance(accepted, list) or not accepted:
+                raise ValueError(
+                    f"Q{n}: missing text answers"
+                )
+
+        prepared_questions.append({
+            "number": n,
+            "position": position,
+            "question_type": TYPE_MAP[kind],
+            "answer_format": answer_format,
+            "prompt": prompt,
+            "options": options,
+            "config": q.get("config") or {},
+            "correct_answer": answer,
+        })
+
+    return {
+        "title": f"Questions {first}-{last}",
+        "instructions": instructions,
+        "content": content,
+        "options": shared or None,
+        "questions": prepared_questions,
+    }
+
+
+def prepare_data():
+    if not SOURCE.is_file():
+        raise FileNotFoundError(SOURCE)
+
+    raw = SOURCE.read_bytes()
+    digest = hashlib.sha256(raw).hexdigest()
+
+    data = json.loads(raw.decode("utf-8"))
+    passages = data["passages"]
+
+    if len(passages) != 3:
+        raise ValueError("Expected three passages")
+
+    result = []
+    numbers = []
+
+    for expected_position, passage in enumerate(passages, 1):
+        if passage["number"] != expected_position:
+            raise ValueError("Passage order mismatch")
+
+        groups = [
+            prepare_group(g)
+            for g in passage["question_groups"]
+        ]
+
+        for group in groups:
+            numbers.extend(
+                q["number"] for q in group["questions"]
+            )
+
+        result.append({
+            "title": passage["title"],
+            "content": clean_passage(passage),
+            "groups": groups,
+        })
+
+    if numbers != list(range(1, 41)):
+        raise ValueError(
+            f"Invalid question numbering: {numbers}"
+        )
+
+    if sum(len(p["groups"]) for p in result) != 8:
+        raise ValueError("Expected eight question groups")
+
+    return result, digest
+
+
+def import_draft(passages):
+    import psycopg
+    from psycopg.types.json import Jsonb
+
+    url = os.getenv("DATABASE_URL")
+
+    if not url:
+        raise RuntimeError(
+            "DATABASE_URL environment variable is missing"
+        )
+
+    # Transaction starts automatically. The connection
+    # commits only if the entire import succeeds.
+    with psycopg.connect(
+        url,
+        sslmode="require",
+        connect_timeout=20,
+        prepare_threshold=None,
+    ) as conn:
+
+        with conn.cursor() as cur:
+
+            # Prevent concurrent runs of this importer.
+            cur.execute(
+                "SELECT pg_advisory_xact_lock(hashtext(%s))",
+                (TITLE,),
+            )
+
+            cur.execute(
+                "SELECT id FROM public.tests WHERE title = %s",
+                (TITLE,),
+            )
+            existing = cur.fetchall()
+
+            if len(existing) > 1:
+                raise RuntimeError(
+                    "Multiple tests have this title. "
+                    "Manual review required."
+                )
+
+            if existing:
+                test_id = existing[0][0]
+
+                cur.execute(
+                    """
+                    SELECT id FROM public.test_versions
+                    WHERE test_id = %s AND status = 'draft'
+                    """,
+                    (test_id,),
+                )
+
+                if cur.fetchone():
+                    raise RuntimeError(
+                        "An existing Draft was found. "
+                        "Import stopped to prevent duplication."
+                    )
+
+                cur.execute(
+                    """
+                    SELECT COALESCE(MAX(version_number), 0) + 1
+                    FROM public.test_versions
+                    WHERE test_id = %s
+                    """,
+                    (test_id,),
+                )
+                version_number = cur.fetchone()[0]
+
+            else:
+                cur.execute(
+                    """
+                    INSERT INTO public.tests
+                        (title, description, type,
+                         visibility, access_type)
+                    VALUES (%s, %s, 'reading',
+                            'hidden', 'public')
+                    RETURNING id
+                    """,
+                    (
+                        TITLE,
+                        "Cambridge 21 Reading Test 1 "
+                        "- imported for demo review",
+                    ),
+                )
+
+                test_id = cur.fetchone()[0]
+                version_number = 1
+
+            cur.execute(
+                """
+                INSERT INTO public.test_versions
+                    (test_id, version_number, status)
+                VALUES (%s, %s, 'draft')
+                RETURNING id
+                """,
+                (test_id, version_number),
+            )
+            version_id = cur.fetchone()[0]
+
+            # Practice mode only for initial demo.
+            cur.execute(
+                """
+                INSERT INTO public.test_version_modes
+                    (test_version_id, mode, enabled,
+                     answer_visibility, allow_pause,
+                     allow_replay, allow_seek)
+                VALUES
+                    (%s, 'practice', true,
+                     'after_submit', true, false, false)
+                """,
+                (version_id,),
+            )
+
+            for section_pos, passage in enumerate(passages, 1):
+                cur.execute(
+                    """
+                    INSERT INTO public.sections
+                        (test_version_id, section_type,
+                         title, content, position)
+                    VALUES (%s, 'reading', %s, %s, %s)
+                    RETURNING id
+                    """,
+                    (
+                        version_id,
+                        passage["title"],
+                        passage["content"],
+                        section_pos,
+                    ),
+                )
+                section_id = cur.fetchone()[0]
+
+                for group_pos, group in enumerate(
+                    passage["groups"], 1
+                ):
+                    cur.execute(
+                        """
+                        INSERT INTO public.question_groups
+                            (section_id, title,
+                             instructions, content,
+                             options, rules, position)
+                        VALUES
+                            (%s, %s, %s, %s, %s, %s, %s)
+                        RETURNING id
+                        """,
+                        (
+                            section_id,
+                            group["title"],
+                            group["instructions"],
+                            group["content"],
+                            (
+                                Jsonb(group["options"])
+                                if group["options"] is not None
+                                else None
+                            ),
+                            Jsonb({}),
+                            group_pos,
+                        ),
+                    )
+                    group_id = cur.fetchone()[0]
+
+                    for q in group["questions"]:
+                        cur.execute(
+                            """
+                            INSERT INTO public.questions
+                                (question_group_id,
+                                 question_type, prompt,
+                                 config, position,
+                                 max_score, answer_format,
+                                 options, display_number)
+                            VALUES
+                                (%s, %s, %s, %s, %s,
+                                 1, %s, %s, %s)
+                            RETURNING id
+                            """,
+                            (
+                                group_id,
+                                q["question_type"],
+                                q["prompt"],
+                                Jsonb(q["config"]),
+                                q["position"],
+                                q["answer_format"],
+                                (
+                                    Jsonb(q["options"])
+                                    if q["options"] is not None
+                                    else None
+                                ),
+                                q["number"],
+                            ),
+                        )
+
+                        question_id = cur.fetchone()[0]
+
+                        cur.execute(
+                            """
+                            INSERT INTO public.answer_keys
+                                (question_id, correct_answer,
+                                 grading_config)
+                            VALUES (%s, %s, %s)
+                            """,
+                            (
+                                question_id,
+                                Jsonb(q["correct_answer"]),
+                                Jsonb({}),
+                            ),
+                        )
+
+            # Verify actual database rows before commit.
+            cur.execute(
+                """
+                SELECT
+                    COUNT(*),
+                    COALESCE(SUM(q.max_score), 0),
+                    COUNT(ak.question_id),
+                    ARRAY_AGG(
+                        q.display_number
+                        ORDER BY q.display_number
+                    )
+                FROM public.sections s
+                JOIN public.question_groups g
+                    ON g.section_id = s.id
+                JOIN public.questions q
+                    ON q.question_group_id = g.id
+                LEFT JOIN public.answer_keys ak
+                    ON ak.question_id = q.id
+                WHERE s.test_version_id = %s
+                """,
+                (version_id,),
+            )
+
+            question_count, marks, keys, numbers = cur.fetchone()
+
+            if (
+                question_count != 40
+                or marks != 40
+                or keys != 40
+                or numbers != list(range(1, 41))
+            ):
+                raise RuntimeError(
+                    "Post-import verification failed. "
+                    "Transaction will roll back."
+                )
+
+            cur.execute(
+                """
+                SELECT
+                    COUNT(DISTINCT s.id),
+                    COUNT(DISTINCT g.id)
+                FROM public.sections s
+                LEFT JOIN public.question_groups g
+                    ON g.section_id = s.id
+                WHERE s.test_version_id = %s
+                """,
+                (version_id,),
+            )
+
+            section_count, group_count = cur.fetchone()
+
+            if section_count != 3 or group_count != 8:
+                raise RuntimeError(
+                    "Section/group count mismatch. "
+                    "Transaction will roll back."
+                )
+
+            print("\n--- DATABASE VERIFIED ---")
+            print("Test ID:", test_id)
+            print("Version ID:", version_id)
+            print("Version number:", version_number)
+            print("Status: draft")
+            print("Sections:", section_count)
+            print("Groups:", group_count)
+            print("Questions:", question_count)
+            print("Answer keys:", keys)
+            print("Marks:", marks)
+
+    print("\nIMPORT COMMITTED SUCCESSFULLY")
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--apply",
+        action="store_true",
+        help="Actually write to Supabase",
+    )
+    args = parser.parse_args()
+
+    passages, digest = prepare_data()
+
+    groups = sum(len(p["groups"]) for p in passages)
+    questions = sum(
+        len(g["questions"])
+        for p in passages
+        for g in p["groups"]
+    )
+
+    print("\n--- SOURCE VALIDATION ---")
+    print("Source:", SOURCE)
+    print("SHA256:", digest)
+    print("Passages:", len(passages))
+    print("Groups:", groups)
+    print("Questions:", questions)
+    print("Expected marks:", questions)
+
+    if not args.apply:
+        print("\nDRY RUN PASS - NO DATABASE CHANGES")
+        return
+
+    import_draft(passages)
+
+
+if __name__ == "__main__":
+    main()
+
+
+========== run_pipeline.py ==========
+
+
+import argparse
+import json
+import py_compile
+import subprocess
+import sys
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent
+
+SCRIPTS = {
+    "extract": "pipeline/extract_pdf_layout.py",
+    "structure": "pipeline/detect_reading_structure.py",
+    "questions": "pipeline/parse_reading_questions.py",
+    "review": "review/apply_question_reviews.py",
+    "answers": "pipeline/map_answer_keys.py",
+    "qa": "review/validate_reading_dataset.py",
+    "finalize": "review/finalize_reading_dataset.py",
+    "import": "importers/import_cambridge21_reading_test1.py",
+}
+
+
+def check():
+    for name, relative in SCRIPTS.items():
+        path = ROOT / relative
+
+        if not path.is_file():
+            raise FileNotFoundError(path)
+
+        py_compile.compile(str(path), doraise=True)
+        print(f"OK: {name}")
+
+    dataset = ROOT / "output/stage6/reading_test1_demo.json"
+
+    if dataset.exists():
+        data = json.loads(dataset.read_text(encoding="utf-8"))
+        passages = data["passages"]
+        groups = [
+            g for p in passages
+            for g in p["question_groups"]
+        ]
+        questions = [
+            q for g in groups
+            for q in g["questions"]
+        ]
+
+        numbers = sorted(q["number"] for q in questions)
+
+        if (
+            len(passages) != 3
+            or len(groups) != 8
+            or numbers != list(range(1, 41))
+        ):
+            raise ValueError("Dataset coverage check failed")
+
+        print("\nReading Test 1: 3 passages / 8 groups / 40 questions")
+
+    print("\nSTRUCTURE CHECK PASS")
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "command",
+        choices=["check", *SCRIPTS.keys()],
+    )
+    args, extra = parser.parse_known_args()
+
+    if args.command == "check":
+        if extra:
+            parser.error("check does not accept extra arguments")
+        check()
+        return
+
+    if args.command == "import" and "--apply" in extra:
+        parser.error(
+            "Draft already imported. "
+            "Database writes are disabled in this runner."
+        )
+
+    script = ROOT / SCRIPTS[args.command]
+
+    subprocess.run(
+        [sys.executable, str(script), *extra],
+        cwd=ROOT,
+        check=True,
+    )
+
+
+if __name__ == "__main__":
+    main()
+

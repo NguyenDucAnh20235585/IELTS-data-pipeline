@@ -1,0 +1,37 @@
+
+{
+  "question_groups": [
+    {
+      "from": 1,
+      "to": 5,
+      "source_pdf_page": 41,
+      "render_template": "Complete the table below.\nChoose ONE WORD ONLY from the passage for each answer.\n\nResearch into sleep and dreaming\n\n| Subject | Research findings | Comment |\n| --- | --- | --- |\n| Humans | Humans experience REM sleep and non-REM sleep. In REM sleep, the eyes and muscles move. | |\n| {{gap:1}} | Similar brain patterns were observed when active and sleeping. | Indicative of dreaming |\n| Pigeons | When sleeping, pigeons displayed activity in parts of the brain that deal with {{gap:2}} input. | May have been dreaming of flying |\n| Whales and dolphins | Still have {{gap:3}} their brain awake when they sleep. Don't experience REM sleep, as this could affect their sensitivity to {{gap:4}}. | Their dreams are probably not very {{gap:5}}. |"
+    },
+    {
+      "from": 20,
+      "to": 21,
+      "source_pdf_page": 45,
+      "grading_rule": {
+        "mode": "unordered_unique_choices",
+        "correct_choices": ["B", "D"]
+      }
+    },
+    {
+      "from": 30,
+      "to": 35,
+      "source_pdf_page": 50,
+      "trim_after": "\nA reliability",
+      "options": [
+        {"key": "A", "text": "reliability"},
+        {"key": "B", "text": "funding"},
+        {"key": "C", "text": "skills"},
+        {"key": "D", "text": "prejudices"},
+        {"key": "E", "text": "computers"},
+        {"key": "F", "text": "equality"},
+        {"key": "G", "text": "framework"},
+        {"key": "H", "text": "confidentiality"},
+        {"key": "I", "text": "approval"}
+      ]
+    }
+  ]
+}
